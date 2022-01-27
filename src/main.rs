@@ -60,8 +60,8 @@ fn main() {
 
     DICT.set(Dictionary { dict }).ok().unwrap();
 
-    println!("Guess \"irate\"");
-    let mut word = Word::<5>::from_str("irate");
+    println!("Guess \"tares\"");
+    let mut word = Word::<5>::from_str("tares");
 
     macro_rules! wrong_input {
         () => {{
@@ -81,16 +81,28 @@ fn main() {
 
     let mut input = String::new();
     let mut first = true;
-    let mut index = 0;
 
     loop {
         if !first {
+            let mut index = 0;
             loop {
                 word = words[index];
                 println!("Guess \"{:?}\"", word);
                 read_line!(input);
 
-                if input != "pass" {
+                if input.starts_with('=') {
+                    match Word::<5>::from_str_checked(&input[1 ..]) {
+                        Some(replacement) => {
+                            word = replacement;
+                            read_line!(input);
+                            break;
+                        },
+                        None => {
+                            println!("Please enter a 5-letter word");
+                            continue;
+                        }
+                    }
+                } else if input != "pass" {
                     break;
                 } else {
                     index += 1;
@@ -116,6 +128,7 @@ fn main() {
         };
 
         words = words.into_iter().filter(|word| word.test(&mask)).collect();
+        println!("Considering {} possible words", words.len());
 
         let map = words
             .par_iter()
@@ -177,12 +190,21 @@ impl<const N: usize> Word<N> {
         Self { chars }
     }
 
-    pub fn from_str(string: &str) -> Self {
+    pub fn from_str_checked(string: &str) -> Option<Self> {
+        if string.len() != N {
+            return None;
+        }
+
         let mut chars = [0u8; N];
         for (index, ch) in string.chars().enumerate() {
             chars[index] = ch as u8 - 'a' as u8;
         }
-        Self { chars }
+
+        Some(Self { chars })
+    }
+
+    pub fn from_str(string: &str) -> Self {
+        Self::from_str_checked(string).unwrap()
     }
 
     pub fn contents(&self, mask: &Mask<N>) -> u128 {
