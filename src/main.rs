@@ -2,16 +2,19 @@ use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::AtomicU64;
 use std::{
     fmt::{self, Debug, Formatter},
     fs,
     io::stdin,
     str,
 };
+use std::sync::atomic::Ordering;
 
-static DICT: OnceCell<Dictionary<5>> = OnceCell::new();
+const WORD_SIZE: usize = 5;
+static DICT: OnceCell<Dictionary<WORD_SIZE>> = OnceCell::new();
 
-fn d() -> &'static Dictionary<5> {
+fn d() -> &'static Dictionary<WORD_SIZE> {
     unsafe { DICT.get_unchecked() }
 }
 
@@ -19,12 +22,16 @@ fn main() {
     let dict = fs::read_to_string("dictionary.txt").unwrap();
     let mut dict = dict
         .split('\n')
-        .filter(|&word| word.len() == 5)
-        .map(|word| word.as_bytes())
-        .map(|word| [word[0], word[1], word[2], word[3], word[4]])
+        .filter(|&word| word.len() == WORD_SIZE)
+        .map(|word| {
+            word.as_bytes()
+                .to_owned()
+                .try_into()
+                .unwrap()
+        })
         .map(Word::new)
-        .map(|word| (word, 1.20f64))
-        .collect::<HashMap<Word<5>, f64>>();
+        .map(|word| (word, 1f64))
+        .collect::<HashMap<Word<WORD_SIZE>, f64>>();
     let mut words = dict.keys().copied().collect::<Vec<_>>();
 
     let freq = fs::read_to_string("freq.txt").unwrap();
@@ -45,11 +52,11 @@ fn main() {
         };
         let w = line[index + 1..].trim();
 
-        if w.len() != 5 {
+        if w.len() != WORD_SIZE {
             continue;
         }
 
-        let w = Word::<5>::from_str(w);
+        let w = Word::<WORD_SIZE>::from_str(w);
         if let Some(wf) = dict.get_mut(&w) {
             *wf = f;
         }
@@ -60,8 +67,8 @@ fn main() {
 
     DICT.set(Dictionary { dict }).ok().unwrap();
 
-    println!("Guess \"tares\"");
-    let mut word = Word::<5>::from_str("tares");
+    println!("Guess \"irate\"");
+    let mut word = Word::<WORD_SIZE>::from_str("irate");
 
     macro_rules! wrong_input {
         () => {{
@@ -91,14 +98,14 @@ fn main() {
                 read_line!(input);
 
                 if input.starts_with('=') {
-                    match Word::<5>::from_str_checked(&input[1 ..]) {
+                    match Word::<WORD_SIZE>::from_str_checked(&input[1 ..]) {
                         Some(replacement) => {
                             word = replacement;
                             read_line!(input);
                             break;
                         },
                         None => {
-                            println!("Please enter a 5-letter word");
+                            println!("Please enter a {}-letter word", WORD_SIZE);
                             continue;
                         }
                     }
@@ -116,7 +123,7 @@ fn main() {
             return;
         }
 
-        if input.len() != 5 {
+        if input.len() != WORD_SIZE {
             wrong_input!()
         }
 
@@ -130,11 +137,21 @@ fn main() {
         words = words.into_iter().filter(|word| word.test(&mask)).collect();
         println!("Considering {} possible words", words.len());
 
+        if words.len() <= 10 {
+            words.sort_unstable_by(|a, b| {
+                let dict = d();
+                dict.prob(b).partial_cmp(&dict.prob(a)).unwrap()
+            });
+            continue;
+        }
+
+        let min: AtomicU64 = AtomicU64::new(f64::MAX.to_bits());
+
         let map = words
             .par_iter()
             .map(|guess| {
                 let mut total = 0.0f64;
-                let mut div = 0.0f64;
+                let bound = f64::from_bits(min.load(Ordering::Acquire));
 
                 for actual in &words {
                     let mask = guess.diff(actual);
@@ -142,24 +159,39 @@ fn main() {
                     let portion = words.iter().filter(|sample| sample.test(&mask)).count();
                     let actual_prob = d().prob(actual);
                     total += actual_prob * (portion as f64 / words.len() as f64);
-                    div += actual_prob;
+
+                    if total > bound {
+                        return (*guess, f64::MAX);
+                    }
                 }
 
-                if div == 0.0 {
-                    total = 1.0;
-                } else {
-                    total /= div;
+                let raw_bound = min.load(Ordering::Acquire);
+                let bound = f64::from_bits(raw_bound);
+                let new_bound = total.to_bits();
+                if total < bound {
+                    let _ = min.compare_exchange_weak(
+                        raw_bound,
+                        new_bound,
+                        Ordering::Release,
+                        Ordering::Relaxed
+                    );
                 }
 
                 (*guess, total)
             })
-            .collect::<HashMap<Word<5>, f64>>();
+            .collect::<HashMap<Word<WORD_SIZE>, f64>>();
         words.sort_unstable_by(|a, b| {
             let a_score = map.get(a).copied().unwrap_or(1.0f64);
             let b_score = map.get(b).copied().unwrap_or(1.0f64);
-            a_score
+            let ordering = a_score
                 .partial_cmp(&b_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if ordering == std::cmp::Ordering::Equal {
+                let dict = d();
+                dict.prob(b).partial_cmp(&dict.prob(a)).unwrap()
+            } else {
+                ordering
+            }
         });
 
         first = false;
