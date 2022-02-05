@@ -1,21 +1,16 @@
-use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::atomic::AtomicU64;
+use std::sync::Mutex;
 use std::{
     fmt::{self, Debug, Formatter},
-    fs,
-    io::stdin,
-    str,
+    fs, str,
 };
-use std::sync::atomic::Ordering;
+use std::io::stdin;
 
 const WORD_SIZE: usize = 5;
-static DICT: OnceCell<Dictionary<WORD_SIZE>> = OnceCell::new();
 
-fn d() -> &'static Dictionary<WORD_SIZE> {
-    unsafe { DICT.get_unchecked() }
+fn to_word(word: &str) -> Word<WORD_SIZE> {
+    Word::new(word.as_bytes().to_owned().try_into().unwrap())
 }
 
 fn main() {
@@ -23,52 +18,24 @@ fn main() {
     let mut dict = dict
         .split('\n')
         .filter(|&word| word.len() == WORD_SIZE)
-        .map(|word| {
-            word.as_bytes()
-                .to_owned()
-                .try_into()
-                .unwrap()
-        })
-        .map(Word::new)
+        .map(to_word)
         .map(|word| (word, 1f64))
         .collect::<HashMap<Word<WORD_SIZE>, f64>>();
-    let mut words = dict.keys().copied().collect::<Vec<_>>();
+    let wordle_dict = fs::read_to_string("wordle-dictionary.txt").unwrap();
+    let mut candidate_words = Vec::new();
+    wordle_dict
+        .split('\n')
+        .filter(|&word| word.len() == WORD_SIZE)
+        .map(to_word)
+        .for_each(|word| {
+            candidate_words.push(word);
+            dict.insert(word, 1f64);
+        });
 
-    let freq = fs::read_to_string("freq.txt").unwrap();
+    let mut guess_words = dict.keys().copied().collect::<Vec<_>>();
 
-    for line in freq.split('\n') {
-        let index = match line
-            .char_indices()
-            .find(|&(_, ch)| ch == ' ')
-            .map(|(index, _)| index)
-        {
-            Some(index) => index,
-            None => continue,
-        };
-
-        let f = match f64::from_str(line[..index].trim()) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let w = line[index + 1..].trim();
-
-        if w.len() != WORD_SIZE {
-            continue;
-        }
-
-        let w = Word::<WORD_SIZE>::from_str(w);
-        if let Some(wf) = dict.get_mut(&w) {
-            *wf = f;
-        }
-    }
-
-    let total = dict.values().copied().sum::<f64>();
-    dict.values_mut().for_each(|f| *f /= total);
-
-    DICT.set(Dictionary { dict }).ok().unwrap();
-
-    println!("Guess \"irate\"");
-    let mut word = Word::<WORD_SIZE>::from_str("irate");
+    println!("Guess \"roate\"");
+    let mut word = Word::<WORD_SIZE>::from_str("roate");
 
     macro_rules! wrong_input {
         () => {{
@@ -93,7 +60,7 @@ fn main() {
         if !first {
             let mut index = 0;
             loop {
-                word = words[index];
+                word = guess_words[index];
                 println!("Guess \"{:?}\"", word);
                 read_line!(input);
 
@@ -134,77 +101,54 @@ fn main() {
             }
         };
 
-        words = words.into_iter().filter(|word| word.test(&mask)).collect();
-        println!("Considering {} possible words", words.len());
+        candidate_words = candidate_words.into_iter().filter(|word| word.test(&mask)).collect();
+        println!("Considering {} possible words", candidate_words.len());
 
-        if words.len() <= 10 {
-            words.sort_unstable_by(|a, b| {
-                let dict = d();
-                dict.prob(b).partial_cmp(&dict.prob(a)).unwrap()
-            });
-            continue;
+        if candidate_words.len() == 1 {
+            println!("Guess {:?}", candidate_words[0]);
+            return;
         }
 
-        let min: AtomicU64 = AtomicU64::new(f64::MAX.to_bits());
+        // if guess_words.len() <= 3 {
+        //     guess_words = candidate_words.clone();
+        // }
 
-        let map = words
+        let min: Mutex<usize> = Mutex::new(usize::MAX);
+
+        let map = guess_words
             .par_iter()
             .map(|guess| {
-                let mut total = 0.0f64;
-                let bound = f64::from_bits(min.load(Ordering::Acquire));
+                let mut total = 0;
+                let bound = *min.lock().unwrap();
 
-                for actual in &words {
+                for actual in &candidate_words {
                     let mask = guess.diff(actual);
 
-                    let portion = words.iter().filter(|sample| sample.test(&mask)).count();
-                    let actual_prob = d().prob(actual);
-                    total += actual_prob * (portion as f64 / words.len() as f64);
+                    let portion = candidate_words.iter().filter(|sample| sample.test(&mask)).count();
+                    total += portion;
 
                     if total > bound {
-                        return (*guess, f64::MAX);
+                        return (*guess, usize::MAX);
                     }
                 }
 
-                let raw_bound = min.load(Ordering::Acquire);
-                let bound = f64::from_bits(raw_bound);
-                let new_bound = total.to_bits();
-                if total < bound {
-                    let _ = min.compare_exchange_weak(
-                        raw_bound,
-                        new_bound,
-                        Ordering::Release,
-                        Ordering::Relaxed
-                    );
+                let mut bound = min.lock().unwrap();
+                if total < *bound {
+                    *bound = total;
                 }
+                drop(bound);
 
                 (*guess, total)
             })
-            .collect::<HashMap<Word<WORD_SIZE>, f64>>();
-        words.sort_unstable_by(|a, b| {
-            let a_score = map.get(a).copied().unwrap_or(1.0f64);
-            let b_score = map.get(b).copied().unwrap_or(1.0f64);
-            let ordering = a_score
-                .partial_cmp(&b_score)
-                .unwrap_or(std::cmp::Ordering::Equal);
-            if ordering == std::cmp::Ordering::Equal {
-                let dict = d();
-                dict.prob(b).partial_cmp(&dict.prob(a)).unwrap()
-            } else {
-                ordering
-            }
+            .collect::<HashMap<Word<WORD_SIZE>, usize>>();
+        guess_words.sort_unstable_by(|a, b| {
+            let a_score = map.get(a).copied().unwrap();
+            let b_score = map.get(b).copied().unwrap();
+            a_score
+                .cmp(&b_score)
         });
 
         first = false;
-    }
-}
-
-struct Dictionary<const N: usize> {
-    dict: HashMap<Word<N>, f64>,
-}
-
-impl<const N: usize> Dictionary<N> {
-    fn prob(&self, word: &Word<N>) -> f64 {
-        self.dict.get(word).copied().unwrap_or(0.0)
     }
 }
 
@@ -250,6 +194,7 @@ impl<const N: usize> Word<N> {
                 if matches!(mask.constraints[index], Constraint::Fixed(_)) {
                     0
                 } else {
+                    assert!(offset[ch as usize] < 4);
                     let value = 1u128 << (4 * ch + offset[ch as usize]);
                     offset[ch as usize] += 1;
                     value
@@ -278,6 +223,7 @@ impl<const N: usize> Word<N> {
                 constraints[index]
             } else if counts[ch_index] > 0 {
                 counts[ch_index] -= 1;
+                assert!(inv_counts[ch_index] < 4);
                 let c = Constraint::Contains(ch, inv_counts[ch_index]);
                 inv_counts[ch_index] += 1;
                 c
@@ -342,7 +288,7 @@ impl<const N: usize> Mask<N> {
 
         for (index, ch) in pat.chars().enumerate() {
             constraints[index] = match ch {
-                '+' => Constraint::Fixed(word.chars[index]),
+                'x' => Constraint::Fixed(word.chars[index]),
                 'o' => {
                     let c =
                         Constraint::Contains(word.chars[index], counts[word.chars[index] as usize]);
